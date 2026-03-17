@@ -1,6 +1,47 @@
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
+using ModelContextProtocol.AspNetCore.Authentication;
 using ModelContextProtocol.WebApi.Services;
+using System.Text;
+using System.Text.Json;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
 
 var builder = WebApplication.CreateBuilder(args);
+var serverUrl = "http://localhost:5000";
+var jwtSecret = "My secret key My secret key My secret key My secret key My secret key My secret key My secret key My secret key My secret key My secret key My secret key My secret key My secret key My secret key";
+var jwtIssuer = serverUrl;   // "Issuer" yerine serverUrl
+var jwtAudience = serverUrl; // "Audience" yerine serverUrl
+
+builder.Services.AddAuthentication(options =>
+{
+    options.DefaultChallengeScheme = McpAuthenticationDefaults.AuthenticationScheme;
+    options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+}).AddJwtBearer(opt =>
+{
+    opt.TokenValidationParameters.ValidateIssuer = true;
+    opt.TokenValidationParameters.ValidateAudience = true;
+    opt.TokenValidationParameters.ValidateIssuerSigningKey = true;
+    opt.TokenValidationParameters.ValidateLifetime = true;
+    opt.TokenValidationParameters.ValidIssuer = jwtIssuer;
+    opt.TokenValidationParameters.ValidAudience = jwtAudience;
+    opt.TokenValidationParameters.IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret));
+})
+.AddMcp(options =>
+{
+    options.ResourceMetadata = new()
+    {
+        Resource = serverUrl,
+        // Auth server'ınızın OAuth 2.0 metadata endpoint'i olmalı
+        // GET /.well-known/oauth-authorization-server döndürmeli
+        AuthorizationServers = new List<string> { serverUrl },
+        ScopesSupported = new[] { "mcp:tools" }
+    };
+});
+builder.Services.AddAuthorization();
+
+builder.Services.AddHttpContextAccessor();
+
 builder.Services.AddTransient<WeatherService>();
 builder.Services.AddMcpServer().WithHttpTransport().WithToolsFromAssembly();
 builder.Services.AddControllers();
@@ -15,8 +56,187 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 
+app.UseAuthentication();
 app.UseAuthorization();
+// ✅ OAuth Authorization Server Metadata (RFC 8414)
+app.MapGet("/.well-known/oauth-authorization-server", () => Results.Json(new
+{
+    issuer = serverUrl,
+    authorization_endpoint = $"{serverUrl}/oauth/authorize",
+    token_endpoint = $"{serverUrl}/oauth/token",
+    registration_endpoint = $"{serverUrl}/oauth/register",
+    response_types_supported = new[] { "code" },
+    grant_types_supported = new[] { "authorization_code", "refresh_token" },
+    code_challenge_methods_supported = new[] { "S256" }, // PKCE
+    scopes_supported = new[] { "mcp:tools" },
+    token_endpoint_auth_methods_supported = new[] { "none" } // public client
+}));
 
+var registeredClients = new Dictionary<string, string>(); // clientId -> clientName
+
+app.MapPost("/oauth/register", async (HttpContext context) =>
+{
+    var body = await context.Request.ReadFromJsonAsync<JsonElement>();
+
+    var clientId = Guid.NewGuid().ToString("N");
+    var clientName = body.TryGetProperty("client_name", out var name)
+        ? name.GetString() ?? "unknown"
+        : "unknown";
+
+    registeredClients[clientId] = clientName;
+
+    return Results.Json(new
+    {
+        client_id = clientId,
+        client_name = clientName,
+        redirect_uris = body.TryGetProperty("redirect_uris", out var uris)
+            ? uris : default,
+        grant_types = new[] { "authorization_code", "refresh_token" },
+        response_types = new[] { "code" },
+        token_endpoint_auth_method = "none"
+    }, statusCode: 201);
+});
+
+app.MapGet("/oauth/authorize", (
+    string response_type,
+    string client_id,
+    string redirect_uri,
+    string code_challenge,
+    string code_challenge_method,
+    string? state,
+    string? scope) =>
+{
+    // Login formunu göster
+    var html = $"""
+        <!DOCTYPE html>
+        <html>
+        <head><title>Login</title></head>
+        <body>
+            <h2>MCP Server Login</h2>
+            <form method="post" action="/oauth/login">
+                <input type="hidden" name="redirect_uri" value="{redirect_uri}" />
+                <input type="hidden" name="code_challenge" value="{code_challenge}" />
+                <input type="hidden" name="state" value="{state}" />
+                <label>Username: <input type="text" name="username" /></label><br/>
+                <label>Password: <input type="password" name="password" /></label><br/>
+                <button type="submit">Login</button>
+            </form>
+        </body>
+        </html>
+        """;
+
+    return Results.Content(html, "text/html");
+});
+
+var authCodes = new Dictionary<string, AuthCodeData>();
+
+app.MapPost("/oauth/login", async (HttpContext context) =>
+{
+    var form = await context.Request.ReadFormAsync();
+    var username = form["username"].ToString();
+    var password = form["password"].ToString();
+    var redirectUri = form["redirect_uri"].ToString();
+    var codeChallenge = form["code_challenge"].ToString();
+    var state = form["state"].ToString();
+
+    
+    var code = Guid.NewGuid().ToString("N");
+    authCodes[code] = new AuthCodeData(username, codeChallenge, DateTime.UtcNow.AddMinutes(5));
+
+  
+    var redirectUrl = $"{redirectUri}?code={code}";
+    if (!string.IsNullOrEmpty(state))
+        redirectUrl += $"&state={state}";
+
+    return Results.Redirect(redirectUrl);
+});
+
+
+static string Base64UrlEncode(byte[] input)
+{
+    return Convert.ToBase64String(input).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+}
+
+(string accessToken, string refreshToken) GenerateTokens(string username)
+{
+    var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret));
+    var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+    var claims = new[] { new Claim(ClaimTypes.Name, username) };
+
+    var token = new JwtSecurityToken(
+        issuer: jwtIssuer,
+        audience: jwtAudience,
+        claims: claims,
+        expires: DateTime.UtcNow.AddHours(1),
+        signingCredentials: creds);
+
+    var handler = new JwtSecurityTokenHandler();
+    var accessToken = handler.WriteToken(token);
+    var refreshToken = Guid.NewGuid().ToString("N");
+    return (accessToken, refreshToken);
+}
+
+app.MapPost("/oauth/token", async (HttpContext context) =>
+{
+    var form = await context.Request.ReadFormAsync();
+    var grantType = form["grant_type"].ToString();
+    var code = form["code"].ToString();
+    var codeVerifier = form["code_verifier"].ToString();
+    var refreshToken = form["refresh_token"].ToString();
+
+    if (grantType == "authorization_code")
+    {
+        // Code'u doğrula
+        if (!authCodes.TryGetValue(code, out var codeData))
+            return Results.Json(new { error = "invalid_grant" }, statusCode: 400);
+
+        if (codeData.ExpiresAt < DateTime.UtcNow)
+        {
+            authCodes.Remove(code);
+            return Results.Json(new { error = "invalid_grant" }, statusCode: 400);
+        }
+
+        // PKCE doğrula
+        using var sha256 = System.Security.Cryptography.SHA256.Create();
+        var hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(codeVerifier));
+        var computedChallenge = Base64UrlEncode(hash);
+
+        if (computedChallenge != codeData.CodeChallenge)
+            return Results.Json(new { error = "invalid_grant" }, statusCode: 400);
+
+        authCodes.Remove(code); // Single use
+
+        // JWT üret
+        var (accessToken, newRefreshToken) = GenerateTokens(codeData.Username);
+
+        return Results.Json(new
+        {
+            access_token = accessToken,
+            refresh_token = newRefreshToken,
+            token_type = "Bearer",
+            expires_in = 3600
+        });
+    }
+
+    if (grantType == "refresh_token")
+    {
+        var username = "test";//ValidateRefreshToken(refreshToken);
+        if (username == null)
+            return Results.Json(new { error = "invalid_grant" }, statusCode: 400);
+
+        var (accessToken, newRefreshToken) = GenerateTokens(username);
+        return Results.Json(new
+        {
+            access_token = accessToken,
+            refresh_token = newRefreshToken,
+            token_type = "Bearer",
+            expires_in = 3600
+        });
+    }
+
+    return Results.Json(new { error = "unsupported_grant_type" }, statusCode: 400);
+});
 app.MapGet("/", () => "hello world");
 app.MapMcp("/mcp");
 app.Run();
@@ -62,6 +282,7 @@ public record Sale(
             new("S030","Ayşe Demir", new DateOnly(2026,3,11), 2300)
         };
 }
+public record AuthCodeData(string Username, string CodeChallenge, DateTime ExpiresAt);
 public record Payment(
     string Id,
     string Company,
